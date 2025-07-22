@@ -1,0 +1,90 @@
+#!/bin/bash
+
+# Azure VM Deployment Script for Flask Slack API
+# Run this script on your Azure VM (Ubuntu/Debian based)
+
+echo "Starting deployment of Flask Slack API..."
+
+# Update system packages
+echo "Updating system packages..."
+sudo apt-get update
+sudo apt-get upgrade -y
+
+# Install Python and pip if not already installed
+echo "Installing Python and dependencies..."
+sudo apt-get install -y python3 python3-pip python3-venv nginx
+
+# Create application directory
+echo "Creating application directory..."
+sudo mkdir -p /var/www/slack-api
+sudo chown $USER:$USER /var/www/slack-api
+cd /var/www/slack-api
+
+# Create virtual environment
+echo "Creating virtual environment..."
+python3 -m venv venv
+source venv/bin/activate
+
+# Copy your application files (assuming they're in current directory)
+# You should upload app.py and requirements.txt to the VM first
+echo "Please ensure app.py and requirements.txt are in the current directory"
+
+# Install Python dependencies
+echo "Installing Python dependencies..."
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# Create systemd service file
+echo "Creating systemd service..."
+sudo tee /etc/systemd/system/slack-api.service > /dev/null <<EOF
+[Unit]
+Description=Gunicorn instance to serve Slack API
+After=network.target
+
+[Service]
+User=$USER
+Group=www-data
+WorkingDirectory=/var/www/slack-api
+Environment="PATH=/var/www/slack-api/venv/bin"
+ExecStart=/var/www/slack-api/venv/bin/gunicorn --workers 3 --bind unix:slack-api.sock -m 007 app:app
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Start and enable the service
+echo "Starting Flask application service..."
+sudo systemctl start slack-api
+sudo systemctl enable slack-api
+
+# Configure Nginx
+echo "Configuring Nginx..."
+sudo tee /etc/nginx/sites-available/slack-api > /dev/null <<EOF
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        include proxy_params;
+        proxy_pass http://unix:/var/www/slack-api/slack-api.sock;
+    }
+}
+EOF
+
+# Enable the Nginx site
+sudo ln -s /etc/nginx/sites-available/slack-api /etc/nginx/sites-enabled
+sudo nginx -t
+sudo systemctl restart nginx
+
+# Configure firewall
+echo "Configuring firewall..."
+sudo ufw allow 'Nginx Full'
+sudo ufw allow OpenSSH
+sudo ufw --force enable
+
+echo "Deployment complete!"
+echo "Your API should now be accessible at http://YOUR_VM_IP/"
+echo ""
+echo "To check service status: sudo systemctl status slack-api"
+echo "To view logs: sudo journalctl -u slack-api -f"
+echo "To restart service: sudo systemctl restart slack-api"
