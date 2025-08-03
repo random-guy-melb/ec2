@@ -1,404 +1,407 @@
 from __future__ import annotations
 from typing import List, Dict, Tuple, Any, Optional
-from dateutil.parser import parse
-from jira import JIRA
-from tqdm import tqdm
 from datetime import datetime, timedelta
+from tqdm import tqdm
 import traceback
 
 import pandas as pd
+import requests
 import json
+import time
 import re
 import os
+import random
 
-# from projects.jira.configs import configuration
-
-MAX_EVENTS = 400  # keep at most N history items per bug
-CTRL_REGEX = re.compile(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]')
-TEAM_FIELD_ID = "customfield_11731"
-
-
-# IMPORTANT: For production use, store API_TOKEN as an environment variable:
-# API_TOKEN = os.environ.get('JIRA_API_TOKEN')
+# Constants
+MAX_RETRIES = 5
+INITIAL_BACKOFF = 1
+RATE_LIMIT_STATUS = 429
+DEFAULT_LIMIT = 100
+MAX_MESSAGES_PER_THREAD = 1000
 
 # Base directory for saving data
 BASE_OUTPUT_DIR = "./csv_data"
 # Log file path
-LOG_FILE_PATH = "./csv_data/extraction_log.json"
+LOG_FILE_PATH = "./csv_data/slack_extraction_log.json"
+
+# Slack API endpoints
+USERS_LIST_URL = 'https://slack.com/api/users.list'
+CHANNELS_LIST_URL = 'https://slack.com/api/conversations.list'
+USERGROUPS_LIST_URL = 'https://slack.com/api/usergroups.list'
+CONVERSATIONS_HISTORY_URL = 'https://slack.com/api/conversations.history'
+CONVERSATIONS_REPLIES_URL = 'https://slack.com/api/conversations.replies'
 
 
-def clean_text(t: str | None) -> str:
-    """Strip ASCII control chars except tab / newline."""
-    if not t:
+def clean_text(text: str | None) -> str:
+    """Clean text by removing control characters and normalizing whitespace."""
+    if not text:
         return ""
-    return CTRL_REGEX.sub("", t)
+    # Remove control characters
+    text = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]', '', text)
+    # Normalize whitespace
+    text = ' '.join(text.split())
+    return text.strip()
 
 
-def calc_days(start, end) -> int | None:
-    if not (start and end):
-        return None
-    try:
-        return (parse(end) - parse(start)).days
-    except Exception:
-        return None
+def replace_name_tags(text: str) -> str:
+    """Replace user mention tags with generic @user."""
+    return re.sub(r"<@([A-Z0-9]+)>", "@user", text).strip()
 
 
-def safe(obj, *attrs, default=""):
-    for a in attrs:
-        if hasattr(obj, a):
-            v = getattr(obj, a)
-            if v:
-                return v
-        if isinstance(obj, dict):
-            for a in attrs:
-                if obj.get(a):
-                    return obj[a]
-    return default
+def remove_misc_tags(text: str) -> str:
+    """Remove miscellaneous Slack tags."""
+    return re.sub("<!.*?>", " ", text)
 
 
-def get_versions(issue, field_key="versions") -> str:
-    vers = issue.raw["fields"].get(field_key, [])
-    return ", ".join([safe(v, "name") for v in vers]) if vers else ""
+def unix_timestamp(dt: datetime) -> int:
+    """Convert datetime to Unix timestamp."""
+    return int(dt.timestamp())
 
 
-def get_linked_issues(issue, field_key="issuelinks") -> str:
-    linkedissue = issue.raw["fields"].get(field_key, [])
-    if isinstance(linkedissue, list):
-        linkedissue = " ".join(linkedissue)
-    return linkedissue
-
-
-def get_sprint(issue, field_key="customfield_10004") -> str:
-    sprint = issue.raw["fields"].get(field_key, [])
-    if isinstance(sprint, list) and sprint:
-        print(sprint)
-        try:
-            sprint = " ".join(sprint)
-        except:
-            sprint = " ".join(sprint[0].get("name", "Not Found"))
-    return sprint
-
-
-def get_epicandtheme(issue, field_key="customfield_10113") -> str:
-    epic_theme = issue.raw.get("customfield_10113", {}).get(field_key, [])
-    if isinstance(epic_theme, list):
-        epic_theme = " ".join(epic_theme)
-    return epic_theme
-
-
-def get_epic(issue, field_key="customfield_10000") -> str:
-    epic_name = issue.raw.get("customfield_10000", {}).get(field_key, [])
-    if isinstance(epic_name, list):
-        epic_name = " ".join(epic_name)
-    return epic_name
-
-
-def get_repo(issue) -> str:
-    patt = r'https?://(?:www\.)?(?:github|bitbucket|gitlab)\.com/[\w\-\.]+/[\w\-\.]+'
-    for source in [issue.fields.description] + [
-        getattr(c, "body", "") for c in getattr(issue.fields.comment, "comments", [])
-    ]:
-        if not source:
-            continue
-        m = re.search(patt, source)
-        if m:
-            return m.group(0)
-    return ""
-
-
-def build_timeline(issue) -> Tuple[List[Dict[str, Any]], List[Dict]]:
-    timeline, status_hist = [], []
-    timeline.append(dict(
-        date=issue.fields.created,
-        author=safe(issue.fields.reporter, "displayName", "name"),
-        type="creation",
-        event="Created"
-    ))
-
-    if hasattr(issue, "changelog"):
-        for h in issue.changelog.histories:
-            when = h.created
-            who = safe(h.author, "displayName", "name")
-            for i in h.items:
-                entry = dict(
-                    date=when,
-                    author=who,
-                    type="change",
-                    field=i.field,
-                    frm=clean_text(i.fromString),
-                    to=clean_text(i.toString)
-                )
-                timeline.append(entry)
-                if i.field.lower() == "status":
-                    status_hist.append(entry)
-
-    # comments (optional, can comment this block out if noise)
-    for c in getattr(issue.fields.comment, "comments", []):
-        try:
-            comment = clean_text(c.body)[:500]  # cap long comments
-        except:
-            print("Skipped comment.")
-            continue
-        timeline.append(dict(
-            date=c.created,
-            author=safe(c.author, "displayName", "name"),
-            type="comment",
-            event=comment
-        ))
-
-    # chronological order
-    timeline.sort(key=lambda x: parse(x["date"]))
-
-    # enforce MAX_EVENTS (keeps first & last)
-    if len(timeline) > MAX_EVENTS:
-        timeline = timeline[:MAX_EVENTS // 2] + timeline[-MAX_EVENTS // 2:]
-
-    return timeline, status_hist
-
-
-def to_json_safe(obj) -> str:
-    """
-    Serialise to JSON **and** guarantee it parses back.
-    If it fails (shouldn't), returns empty string.
-    """
-    try:
-        txt = json.dumps(obj, ensure_ascii=False, default=str)
-        json.loads(txt)
-        return txt
-    except Exception as e:
-        print("⚠️ bad JSON, skipping timeline:", e)
-        return ""
-
-
-def format_date_for_jql(date_input: str | datetime) -> str:
-    """
-    Format a date for JQL queries.
-    Accepts string or datetime object and returns formatted string.
-    """
+def format_date_for_filename(date_input: str | datetime) -> str:
+    """Format a date for filename convention."""
     if isinstance(date_input, str):
-        # Parse the string to datetime
-        dt = datetime.strptime(date_input, "%Y-%m-%d") if "-" in date_input else datetime.strptime(date_input,
-                                                                                                   "%Y/%m/%d")
+        dt = datetime.strptime(date_input, "%Y-%m-%d")
     else:
         dt = date_input
-
-    # Format as required by JQL (yyyy-MM-dd HH:mm)
-    return dt.strftime("%Y-%m-%d %H:%M")
+    return dt.strftime("%Y%m%d")
 
 
-def extract_bugs(jira: JIRA,
-                 projects: List[str] | None = None,
-                 max_results: int = 1000,
-                 max_char_len: int = 28000,
-                 start_date: Optional[str] = None,
-                 end_date: Optional[str] = None,
-                 date_field: str = "created") -> Tuple[pd.DataFrame, Dict[str, str]]:
+def make_request_with_backoff(session: requests.Session,
+                              url: str,
+                              params: Dict[str, Any],
+                              max_retries: int = MAX_RETRIES,
+                              initial_backoff: float = INITIAL_BACKOFF) -> Optional[Dict]:
     """
-    Extract bugs from Jira with optional date filtering.
-
-    Parameters:
-    -----------
-    jira : JIRA
-        JIRA connection object
-    projects : List[str] | None
-        List of project keys to filter by
-    max_results : int
-        Maximum number of results to return
-    max_char_len : int
-        Maximum character length for text fields
-    start_date : Optional[str]
-        Start date in format "YYYY-MM-DD" (inclusive)
-    end_date : Optional[str]
-        End date in format "YYYY-MM-DD" (inclusive)
-    date_field : str
-        The date field to filter by: "created", "updated", or "resolved"
-        Default is "created"
-
-    Returns:
-    --------
-    Tuple[pd.DataFrame, Dict[str, str]]
-        DataFrame of bugs and dictionary of timelines
+    Make HTTP request with exponential backoff for rate limiting.
     """
+    for attempt in range(max_retries):
+        try:
+            response = session.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == RATE_LIMIT_STATUS:
+                if attempt < max_retries - 1:
+                    backoff_time = initial_backoff * (2 ** attempt) + random.uniform(0, 1)
+                    print(f"Rate limited. Retrying in {backoff_time:.2f} seconds...")
+                    time.sleep(backoff_time)
+                else:
+                    print(" Max retries reached. Skipping this request.")
+                    return None
+            else:
+                print(f" HTTP error: {e}")
+                return None
+        except requests.RequestException as e:
+            print(f" Request Error: {e}")
+            return None
 
-    # Build base JQL query
-    jql_parts = ["issuetype = Bug"]
 
-    # Add project filter if specified
-    if projects:
-        jql_parts.append(f"project in ({', '.join(projects)})")
+def fetch_workspace_data(session: requests.Session) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    """
+    Fetch all users, channels, and user groups in the workspace.
+    """
+    print("Fetching workspace data...")
 
-    # Add date filters if specified
-    if start_date:
-        # Format the start date for JQL (beginning of day)
-        start_formatted = f"{start_date} 00:00"
-        jql_parts.append(f'{date_field} >= "{start_formatted}"')
-
-    if end_date:
-        # Format the end date for JQL (end of day)
-        end_formatted = f"{end_date} 23:59"
-        jql_parts.append(f'{date_field} <= "{end_formatted}"')
-
-    # Combine all JQL parts
-    jql = " AND ".join(jql_parts)
-
-    # Add ordering by the date field
-    jql += f" ORDER BY {date_field} ASC"
-
-    bugs, timelines = [], {}
-    start, total = 0, None
-    print("🔍", jql)
-
-    # Print date range info if provided
-    if start_date or end_date:
-        date_info = f"📅 Filtering by {date_field} date: "
-        if start_date and end_date:
-            date_info += f"from {start_date} to {end_date}"
-        elif start_date:
-            date_info += f"from {start_date} onwards"
-        else:
-            date_info += f"up to {end_date}"
-        print(date_info)
+    # Fetch users
+    users = {}
+    cursor = None
+    print("Fetching users...")
 
     while True:
-        issues = jira.search_issues(
-            jql, startAt=start, maxResults=100,
-            fields=f"summary,status,created,updated,resolutiondate,priority,project,issuetype,linkedissue,"
-                   f"customfield_10113,customfield_10000,customfield_10001,customfield_10002,customfield_10004,"
-                   f"Sprint,"
-                   f"versions,fixVersions,description,comment,assignee,reporter,{TEAM_FIELD_ID}",
-            expand="changelog"
-        )
+        params = {'limit': 200}
+        if cursor:
+            params['cursor'] = cursor
 
-        if total is None:
-            total = issues.total or 0
-        if not issues:
+        data = make_request_with_backoff(session, USERS_LIST_URL, params)
+
+        if data and data['ok']:
+            for member in data['members']:
+                try:
+                    users[member['id']] = member.get('real_name', member['name'])
+                except:
+                    users[member['id']] = member.get('profile', {}).get('real_name', 'Unknown')
+
+            if data.get('response_metadata', {}).get('next_cursor'):
+                cursor = data['response_metadata']['next_cursor']
+            else:
+                break
+        else:
+            print("Error fetching users. Some user IDs may not be resolved.")
             break
 
-        for iss in tqdm(issues, desc=f"{start + len(issues)}/{total}"):
-            tl, status_hist = build_timeline(iss)
-            tl_json = to_json_safe(tl)
-            if len(str(tl_json)) > max_char_len:
-                continue
+    print(f"Found {len(users)} users")
 
-            bugs.append(dict(
-                BugID=iss.key,
-                Summary=iss.fields.summary,
-                Status=iss.fields.status.name,
-                Project=iss.fields.project.name,
-                ProjectCode=iss.fields.project.key,
-                ProjectID=iss.fields.project.id,
-                Created=iss.fields.created,
-                Updated=iss.fields.updated,
-                Closed=iss.fields.resolutiondate or "",
-                Priority=safe(iss.fields.priority, "name"),
-                Reporter=safe(iss.fields.reporter, "displayName", "name"),
-                Assignee=safe(iss.fields.assignee, "displayName", "name", default="Unassigned"),
-                Description=clean_text(iss.fields.description or "")[:max_char_len],
-                IntroducedVersion=get_versions(iss, "versions"),
-                FixVersion=get_versions(iss, "fixVersions"),
-                LinkedIssue=get_linked_issues(iss, "linkedissue"),
-                Sprint=get_sprint(iss, "customfield_10004"),
-                EpicAndTheme=get_epicandtheme(iss, "customfield_10113"),
-                Epic=get_epic(iss, "customfield_10000"),
-                Team=safe(getattr(iss.fields, TEAM_FIELD_ID, ""), "value", "name"),
-                Repository=get_repo(iss),
-                StatusFlow=" -> ".join([e["to"] for e in status_hist]),
-                TimelineJSON=tl_json,
-                DefectAging=calc_days(iss.fields.created, iss.fields.resolutiondate),
-                DaysToLastUpdate=calc_days(iss.fields.created, iss.fields.updated),
-                TotalStatusChanges=len(status_hist),
-                CommentCount=len(getattr(iss.fields.comment, "comments", [])),
-            ))
+    # Fetch channels
+    channels = {}
+    cursor = None
+    print("Fetching channels...")
 
-            timelines[iss.key] = tl_json
-            if len(bugs) >= max_results:
+    while True:
+        params = {'limit': 200, 'types': 'public_channel,private_channel'}
+        if cursor:
+            params['cursor'] = cursor
+
+        data = make_request_with_backoff(session, CHANNELS_LIST_URL, params)
+
+        if data and data['ok']:
+            for channel in data['channels']:
+                channels[channel['id']] = channel['name']
+
+            if data.get('response_metadata', {}).get('next_cursor'):
+                cursor = data['response_metadata']['next_cursor']
+            else:
+                break
+        else:
+            print("Error fetching channels. Some channel IDs may not be resolved.")
+            break
+
+    print(f"Found {len(channels)} channels")
+
+    # Fetch user groups
+    usergroups = {}
+    print("Fetching user groups...")
+
+    data = make_request_with_backoff(session, USERGROUPS_LIST_URL, {})
+    if data and data['ok']:
+        for group in data['usergroups']:
+            usergroups[group['id']] = group['handle']
+        print(f"Found {len(usergroups)} user groups")
+    else:
+        print("Error fetching user groups. Some user group IDs may not be resolved.")
+
+    return users, channels, usergroups
+
+
+def resolve_names(text: str, users: Dict[str, str], channels: Dict[str, str], usergroups: Dict[str, str]) -> str:
+    """Replace user, channel, and user group IDs with their respective names."""
+
+    def replace_id(match):
+        full_match = match.group(0)
+
+        if match.group(1) == '@':
+            user_id = match.group(2)
+            return f"@{users.get(user_id, user_id)}"
+        elif match.group(1) == '#':
+            channel_id = match.group(2)
+            return f"#{channels.get(channel_id, channel_id)}"
+        elif match.group(1) == '!':
+            group_id = match.group(2)
+            if '^' in group_id:
+                id = group_id.split("^")[1].strip()
+                return f"@{usergroups.get(id, id)}"
+            return full_match
+        else:
+            return full_match
+
+    pattern = r'<([@#!])(U[A-Z0-9]+|C[A-Z0-9]+|subteam\^S[0-9A-Z]+)>'
+    return re.sub(pattern, replace_id, text)
+
+
+def fetch_thread_replies(session: requests.Session, channel_id: str, thread_ts: str) -> List[Dict]:
+    """
+    Fetch all replies in a thread.
+    """
+    replies_params = {
+        "channel": channel_id,
+        "ts": thread_ts,
+        "limit": 100
+    }
+
+    all_replies = []
+    cursor = None
+
+    while len(all_replies) < MAX_MESSAGES_PER_THREAD:
+        if cursor:
+            replies_params['cursor'] = cursor
+
+        data = make_request_with_backoff(session, CONVERSATIONS_REPLIES_URL, replies_params)
+
+        if data and data["ok"]:
+            messages = data["messages"][1:]  # Skip the parent message
+            all_replies.extend(messages)
+
+            if data.get('has_more') and data.get('response_metadata', {}).get('next_cursor'):
+                cursor = data['response_metadata']['next_cursor']
+            else:
+                break
+        else:
+            break
+
+    return all_replies[:MAX_MESSAGES_PER_THREAD]
+
+
+def format_thread_data(thread: List[Dict],
+                       users: Dict[str, str],
+                       channels: Dict[str, str],
+                       usergroups: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Format a thread into a structured dictionary.
+    """
+    parent = thread[0]
+
+    # Get user info
+    user_id = parent.get('user', 'Unknown')
+    user_name = users.get(user_id, user_id)
+
+    # Clean and resolve names in text
+    clean_thread_text = clean_text(resolve_names(parent.get('text', ''), users, channels, usergroups))
+
+    # Format timestamp
+    date = datetime.fromtimestamp(float(parent['ts']))
+    date_str = date.strftime("%Y-%m-%d")
+    datetime_str = date.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Build thread text
+    thread_text = f"{user_name} | {datetime_str}: {clean_thread_text}"
+
+    # Process replies
+    replies_array = []
+    if len(thread) > 1:
+        for reply in thread[1:]:
+            reply_user_id = reply.get('user', 'Unknown')
+            reply_user_name = users.get(reply_user_id, reply_user_id)
+
+            clean_reply = clean_text(resolve_names(reply.get('text', ''), users, channels, usergroups))
+            reply_date = datetime.fromtimestamp(float(reply['ts']))
+
+            replies_array.append(
+                f"{reply_user_name} | {reply_date.strftime('%Y-%m-%d %H:%M:%S')}: {clean_reply}"
+            )
+
+    full_conversation = thread_text
+    if replies_array:
+        full_conversation += "\n\n" + "\n\n".join(replies_array)
+
+    return {
+        'conversation': full_conversation,
+        'date': date_str,
+        'timestamp': parent['ts'],
+        'thread_ts': parent.get('thread_ts', parent['ts']),
+        'user': user_name,
+        'channel_id': parent.get('channel', ''),
+        'reply_count': len(replies_array),
+        'participants': len(set([user_id] + [r.get('user', '') for r in thread[1:]]))
+    }
+
+
+def extract_slack_threads(token: str,
+                          channel_id: str,
+                          start_date: Optional[str] = None,
+                          end_date: Optional[str] = None,
+                          max_threads: Optional[int] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Extract Slack threads from a channel within a date range.
+    """
+    # Initialize session
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    session = requests.Session()
+    session.headers.update(headers)
+
+    # Fetch workspace data
+    users, channels, usergroups = fetch_workspace_data(session)
+
+    # Convert dates to timestamps
+    oldest = unix_timestamp(datetime.strptime(start_date, "%Y-%m-%d")) if start_date else None
+    latest = unix_timestamp(datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)) if end_date else None
+
+    # Initial parameters
+    params = {
+        "channel": channel_id,
+        "limit": DEFAULT_LIMIT
+    }
+    if oldest:
+        params["oldest"] = oldest
+    if latest:
+        params["latest"] = latest
+
+    print(f"\nExtracting threads from channel {channels.get(channel_id, channel_id)}")
+    if start_date and end_date:
+        print(f"Date range: {start_date} to {end_date}")
+
+    all_threads = []
+    total_messages = 0
+
+    # Progress tracking
+    pbar = tqdm(desc="Fetching messages", unit="messages")
+
+    while True:
+        data = make_request_with_backoff(session, CONVERSATIONS_HISTORY_URL, params)
+
+        if data and data["ok"]:
+            messages = data["messages"]
+            total_messages += len(messages)
+            pbar.update(len(messages))
+
+            for message in messages:
+                # Skip bot messages
+                user = message.get("user", message.get("subtype", ""))
+                if user != "USLACKBOT" and "bot" not in user.lower():
+                    thread = [message]
+
+                    # Fetch replies if it's a thread
+                    if message.get("thread_ts") and message.get("reply_count", 0) > 0:
+                        replies = fetch_thread_replies(session, channel_id, message["ts"])
+                        if replies:
+                            thread.extend(replies)
+
+                    all_threads.append(thread)
+
+                    if max_threads and len(all_threads) >= max_threads:
+                        break
+
+            if max_threads and len(all_threads) >= max_threads:
                 break
 
-        if len(bugs) >= max_results or start + len(issues) >= total:
+            if data.get("has_more"):
+                params["cursor"] = data.get("response_metadata", {}).get("next_cursor")
+                if not params["cursor"]:
+                    # Fallback to timestamp-based pagination
+                    params["latest"] = messages[-1]['ts']
+            else:
+                break
+        else:
+            print(" Error fetching messages. Exiting.")
             break
-        start += len(issues)
 
-    return pd.DataFrame(bugs), timelines
+    pbar.close()
 
+    print(f"\nFound {len(all_threads)} threads from {total_messages} messages")
 
-def save_df(df: pd.DataFrame, path="jira_bugs.csv"):
-    df.to_csv(path, index=False, encoding="utf-8-sig")
-    print("💾 CSV:", path)
+    # Convert threads to DataFrame
+    thread_data = []
+    for thread in tqdm(all_threads, desc="Processing threads"):
+        thread_data.append(format_thread_data(thread, users, channels, usergroups))
 
+    df = pd.DataFrame(thread_data)
 
-def save_timelines(tl: Dict[str, str], path="bug_timelines.jsonl"):
-    with open(path, "w", encoding="utf-8") as f:
-        for bug, js in tl.items():
-            f.write(json.dumps({"bug": bug, "timeline": js}, ensure_ascii=False) + "\n")
-    print("💾 timelines:", path)
+    # Stats
+    stats = {
+        'total_threads': len(all_threads),
+        'total_messages': total_messages,
+        'total_replies': sum(t['reply_count'] for t in thread_data),
+        'unique_participants': len(set(m.get('user', '') for thread in all_threads for m in thread)),
+        'channel_name': channels.get(channel_id, channel_id)
+    }
 
-
-def get_default_date_range() -> Tuple[str, str]:
-    """
-    Get default date range:
-    - End date: 3 days before today
-    - Start date: 1 day before end date
-
-    Example: If today is 2025-07-24
-    - End date will be 2025-07-21
-    - Start date will be 2025-07-20
-
-    Returns:
-    --------
-    Tuple[str, str]: (start_date, end_date) in "YYYY-MM-DD" format
-    """
-    today = datetime.now()
-    end_date = today - timedelta(days=3)
-    start_date = end_date - timedelta(days=1)
-
-    return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+    return df, stats
 
 
-def generate_filename(start_date: str, end_date: str, prefix: str = "jira_bugs", extension: str = "csv") -> str:
-    """
-    Generate filename with date convention for cloud storage.
-
-    Parameters:
-    -----------
-    start_date : str
-        Start date in "YYYY-MM-DD" format
-    end_date : str
-        End date in "YYYY-MM-DD" format
-    prefix : str
-        File prefix (default: "jira_bugs")
-    extension : str
-        File extension (default: "csv")
-
-    Returns:
-    --------
-    str: Filename in format "{prefix}_YYYYMMDD_to_YYYYMMDD.{extension}"
-    """
-    # Convert dates to filename format
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-
-    start_str = start_dt.strftime("%Y%m%d")
-    end_str = end_dt.strftime("%Y%m%d")
-
-    return f"{prefix}_{start_str}_to_{end_str}.{extension}"
+def generate_filename(start_date: str, end_date: str, channel_id: str, prefix: str = "slack_threads") -> str:
+    """Generate filename with date and channel convention."""
+    start_str = format_date_for_filename(start_date)
+    end_str = format_date_for_filename(end_date)
+    safe_channel = re.sub(r'[^\w\-]', '_', channel_id)
+    return f"{prefix}_{safe_channel}_{start_str}_to_{end_str}.csv"
 
 
 def log_extraction_run(log_entry: Dict[str, Any], max_log_entries: int = 1000):
-    """
-    Append a log entry to the extraction log file.
-
-    Parameters:
-    -----------
-    log_entry : Dict[str, Any]
-        Dictionary containing log information
-    max_log_entries : int
-        Maximum number of log entries to keep (default: 1000)
-        Older entries are removed when limit is exceeded
-    """
-    # Ensure log directory exists
+    """Append a log entry to the extraction log file."""
     os.makedirs(os.path.dirname(LOG_FILE_PATH), exist_ok=True)
 
-    # Read existing log if it exists
     if os.path.exists(LOG_FILE_PATH):
         try:
             with open(LOG_FILE_PATH, 'r', encoding='utf-8') as f:
@@ -408,206 +411,169 @@ def log_extraction_run(log_entry: Dict[str, Any], max_log_entries: int = 1000):
     else:
         log_data = []
 
-    # Append new entry
     log_data.append(log_entry)
 
-    # Keep only the most recent entries if exceeding max
     if len(log_data) > max_log_entries:
         log_data = log_data[-max_log_entries:]
-        print(f"📝 Log file trimmed to last {max_log_entries} entries")
+        print(f"Log file trimmed to last {max_log_entries} entries")
 
-    # Write updated log
     with open(LOG_FILE_PATH, 'w', encoding='utf-8') as f:
         json.dump(log_data, f, indent=2, ensure_ascii=False)
 
-    print(f"📝 Log entry added to: {LOG_FILE_PATH}")
+    print(f"Log entry added to: {LOG_FILE_PATH}")
 
 
-def create_log_entry(start_date: str,
+def create_log_entry(token_id: str,
+                     channel_id: str,
+                     start_date: str,
                      end_date: str,
-                     date_field: str,
-                     projects: Optional[List[str]],
                      status: str,
-                     bugs_count: int = 0,
+                     threads_count: int = 0,
                      output_file: str = "",
                      error_message: str = "",
-                     execution_time_seconds: float = 0) -> Dict[str, Any]:
-    """
-    Create a standardized log entry for the extraction run.
-
-    Parameters:
-    -----------
-    start_date : str
-        Start date of extraction
-    end_date : str
-        End date of extraction
-    date_field : str
-        Date field used for filtering
-    projects : Optional[List[str]]
-        List of projects filtered (if any)
-    status : str
-        "success", "failed", or "no_data"
-    bugs_count : int
-        Number of bugs extracted
-    output_file : str
-        Path to output file (if created)
-    error_message : str
-        Error message if failed
-    execution_time_seconds : float
-        Time taken to execute
-
-    Returns:
-    --------
-    Dict[str, Any]: Log entry dictionary
-    """
+                     execution_time_seconds: float = 0,
+                     stats: Optional[Dict] = None) -> Dict[str, Any]:
+    """Create a standardized log entry for the extraction run."""
     return {
         "run_timestamp": datetime.now().isoformat(),
         "run_date": datetime.now().strftime("%Y-%m-%d"),
         "run_time": datetime.now().strftime("%H:%M:%S"),
         "input_parameters": {
+            "token_id": token_id,  # Store only identifier, not actual token
+            "channel_id": channel_id,
             "start_date": start_date,
-            "end_date": end_date,
-            "date_field": date_field,
-            "projects": projects or []
+            "end_date": end_date
         },
         "output": {
             "status": status,
-            "bugs_count": bugs_count,
+            "threads_count": threads_count,
             "output_file": output_file,
-            "execution_time_seconds": round(execution_time_seconds, 2)
+            "execution_time_seconds": round(execution_time_seconds, 2),
+            "stats": stats or {}
         },
         "error": error_message if error_message else None
     }
 
 
-def run_extraction(start_date: Optional[str] = None,
+def get_default_date_range(days_back: int = 7) -> Tuple[str, str]:
+    """
+    Get default date range.
+    """
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days_back)
+
+    return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+
+
+def run_extraction(token: str,
+                   channel_id: str,
+                   start_date: Optional[str] = None,
                    end_date: Optional[str] = None,
-                   date_field: str = "resolutiondate",
-                   max_results: int = 1000,
-                   projects: Optional[List[str]] = None,
+                   max_threads: Optional[int] = None,
                    skip_if_exists: bool = False) -> Tuple[pd.DataFrame, str]:
     """
-    Run the Jira bug extraction with specified or default parameters.
-
-    Parameters:
-    -----------
-    start_date : Optional[str]
-        Start date in "YYYY-MM-DD" format. If None, uses default calculation.
-    end_date : Optional[str]
-        End date in "YYYY-MM-DD" format. If None, uses default calculation.
-    date_field : str
-        The date field to filter by: "created", "updated", or "resolved"
-    max_results : int
-        Maximum number of results to return
-    projects : Optional[List[str]]
-        List of project keys to filter by
-    skip_if_exists : bool
-        If True, skip extraction if date range was already successfully extracted
-
-    Returns:
-    --------
-    Tuple[pd.DataFrame, str]: (DataFrame of bugs, output file path)
+    Run the Slack thread extraction with specified parameters.
     """
-    # Track execution time
     start_time = datetime.now()
 
     # Use default dates if not provided
     if start_date is None or end_date is None:
         start_date, end_date = get_default_date_range()
 
-    # Check if already extracted (if requested)
-    if skip_if_exists and check_date_range_extracted(start_date, end_date, date_field):
-        print(f"⏭️  Skipping extraction: Date range {start_date} to {end_date} already extracted successfully")
-        filename = generate_filename(start_date, end_date, prefix="jira_bugs")
-        output_path = os.path.join(BASE_OUTPUT_DIR, filename)
-        print(f"📁 Existing file: {output_path}")
-        return pd.DataFrame(), output_path
-
     # Generate filename
-    filename = generate_filename(start_date, end_date, prefix="jira_bugs")
+    filename = generate_filename(start_date, end_date, channel_id)
     output_path = os.path.join(BASE_OUTPUT_DIR, filename)
+
+    # Check if already exists
+    if skip_if_exists and os.path.exists(output_path):
+        print(f"Skipping extraction: File already exists at {output_path}")
+        return pd.DataFrame(), output_path
 
     # Ensure output directory exists
     os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
 
-    print(f"📅 Extracting bugs from {start_date} to {end_date}")
-    print(f"📁 Output file: {output_path}")
+    print(f"\n{'=' * 60}")
+    print(f"Slack Thread Extractor")
+    print(f"{'=' * 60}")
+    print(f"Extracting threads from {start_date} to {end_date}")
+    print(f"Output file: {output_path}")
 
     # Initialize variables for logging
     df = pd.DataFrame()
     status = "failed"
     error_message = ""
-    bugs_count = 0
+    threads_count = 0
+    stats = {}
+
+    # Mask token for logging
+    token_id = f"{token[:10]}...{token[-4:]}" if len(token) > 14 else "hidden"
 
     try:
-        # Initialize JIRA connection
-        jira = JIRA(server=JIRA_URL, basic_auth=(ADMIN_EMAIL, API_TOKEN))
-
-        # Extract bugs
-        df, tl = extract_bugs(
-            jira,
-            projects=projects,
-            max_results=max_results,
+        # Extract threads
+        df, stats = extract_slack_threads(
+            token=token,
+            channel_id=channel_id,
             start_date=start_date,
             end_date=end_date,
-            date_field=date_field
+            max_threads=max_threads
         )
 
-        bugs_count = len(df)
+        threads_count = len(df)
 
-        # Save if data found
-        if bugs_count > 0:
-            save_df(df, output_path)
-            print(f"\n✅ Successfully extracted {bugs_count} bugs")
+        if threads_count > 0:
+            # Save to CSV
+            df.to_csv(output_path, index=False, encoding='utf-8-sig')
+            print(f"\nSuccessfully extracted {threads_count} threads")
+            print(f"Saved to: {output_path}")
             status = "success"
         else:
-            print(f"\n⚠️  No bugs found for the specified criteria")
+            print(f"\nNo threads found for the specified criteria")
             status = "no_data"
-            output_path = ""  # No file created
+            output_path = ""
 
     except Exception as e:
         error_message = str(e)
-        print(f"\n❌ Error during extraction: {error_message}")
+        print(f"\n Error during extraction: {error_message}")
         print(traceback.format_exc())
         status = "failed"
-        output_path = ""  # No file created
+        output_path = ""
 
     # Calculate execution time
     execution_time = (datetime.now() - start_time).total_seconds()
 
     # Create and save log entry
     log_entry = create_log_entry(
+        token_id=token_id,
+        channel_id=channel_id,
         start_date=start_date,
         end_date=end_date,
-        date_field=date_field,
-        projects=projects,
         status=status,
-        bugs_count=bugs_count,
+        threads_count=threads_count,
         output_file=output_path,
         error_message=error_message,
-        execution_time_seconds=execution_time
+        execution_time_seconds=execution_time,
+        stats=stats
     )
 
     log_extraction_run(log_entry)
+
+    # Print summary
+    if stats:
+        print(f"\nExtraction Summary:")
+        print(f"  - Total threads: {stats['total_threads']}")
+        print(f"  - Total messages: {stats['total_messages']}")
+        print(f"  - Total replies: {stats['total_replies']}")
+        print(f"  - Unique participants: {stats['unique_participants']}")
+        print(f"  - Channel: {stats['channel_name']}")
+        print(f"  - Execution time: {execution_time:.2f} seconds")
 
     return df, output_path
 
 
 def view_extraction_history(last_n: int = 10) -> pd.DataFrame:
-    """
-    View the extraction history from the log file.
-
-    Parameters:
-    -----------
-    last_n : int
-        Number of recent entries to display (default: 10)
-
-    Returns:
-    --------
-    pd.DataFrame: DataFrame with extraction history
-    """
+    """View the extraction history from the log file."""
     if not os.path.exists(LOG_FILE_PATH):
-        print("📝 No extraction history found.")
+        print("No extraction history found.")
         return pd.DataFrame()
 
     try:
@@ -615,61 +581,50 @@ def view_extraction_history(last_n: int = 10) -> pd.DataFrame:
             log_data = json.load(f)
 
         if not log_data:
-            print("📝 Extraction log is empty.")
+            print("Extraction log is empty.")
             return pd.DataFrame()
 
-        # Convert to DataFrame for easy viewing
         df_log = pd.json_normalize(log_data)
 
-        # Select and rename columns for clarity
         columns_to_show = [
             'run_date',
             'run_time',
+            'input_parameters.channel_id',
             'input_parameters.start_date',
             'input_parameters.end_date',
-            'input_parameters.date_field',
             'output.status',
-            'output.bugs_count',
+            'output.threads_count',
             'output.execution_time_seconds'
         ]
 
-        # Check which columns exist
         available_columns = [col for col in columns_to_show if col in df_log.columns]
         df_log = df_log[available_columns]
 
-        # Rename columns for better readability
         rename_dict = {
+            'input_parameters.channel_id': 'channel',
             'input_parameters.start_date': 'start_date',
             'input_parameters.end_date': 'end_date',
-            'input_parameters.date_field': 'date_field',
             'output.status': 'status',
-            'output.bugs_count': 'bugs_count',
-            'output.execution_time_seconds': 'exec_time_sec'
+            'output.threads_count': 'threads',
+            'output.execution_time_seconds': 'exec_time'
         }
         df_log = df_log.rename(columns=rename_dict)
 
-        # Show last N entries
         if len(df_log) > last_n:
-            print(f"📊 Showing last {last_n} extraction runs (total: {len(df_log)})")
+            print(f"Showing last {last_n} extraction runs (total: {len(df_log)})")
             df_log = df_log.tail(last_n)
         else:
-            print(f"📊 Extraction history ({len(df_log)} runs)")
+            print(f"Extraction history ({len(df_log)} runs)")
 
         return df_log
 
     except Exception as e:
-        print(f"❌ Error reading log file: {e}")
+        print(f" Error reading log file: {e}")
         return pd.DataFrame()
 
 
 def get_extraction_summary() -> Dict[str, Any]:
-    """
-    Get a summary of all extraction runs.
-
-    Returns:
-    --------
-    Dict[str, Any]: Summary statistics
-    """
+    """Get a summary of all extraction runs."""
     if not os.path.exists(LOG_FILE_PATH):
         return {"message": "No extraction history found"}
 
@@ -680,24 +635,30 @@ def get_extraction_summary() -> Dict[str, Any]:
         if not log_data:
             return {"message": "Extraction log is empty"}
 
-        # Calculate summary statistics
         total_runs = len(log_data)
         successful_runs = sum(1 for entry in log_data if entry.get('output', {}).get('status') == 'success')
         failed_runs = sum(1 for entry in log_data if entry.get('output', {}).get('status') == 'failed')
         no_data_runs = sum(1 for entry in log_data if entry.get('output', {}).get('status') == 'no_data')
-        total_bugs = sum(entry.get('output', {}).get('bugs_count', 0) for entry in log_data)
+        total_threads = sum(entry.get('output', {}).get('threads_count', 0) for entry in log_data)
 
-        # Get date range of extractions
         run_dates = [entry.get('run_date') for entry in log_data if entry.get('run_date')]
         first_run = min(run_dates) if run_dates else "N/A"
         last_run = max(run_dates) if run_dates else "N/A"
+
+        # Get unique channels
+        channels = set()
+        for entry in log_data:
+            channel = entry.get('input_parameters', {}).get('channel_id')
+            if channel:
+                channels.add(channel)
 
         return {
             "total_runs": total_runs,
             "successful_runs": successful_runs,
             "failed_runs": failed_runs,
             "no_data_runs": no_data_runs,
-            "total_bugs_extracted": total_bugs,
+            "total_threads_extracted": total_threads,
+            "unique_channels": len(channels),
             "first_run_date": first_run,
             "last_run_date": last_run,
             "success_rate": f"{(successful_runs / total_runs) * 100:.1f}%" if total_runs > 0 else "N/A"
@@ -707,65 +668,43 @@ def get_extraction_summary() -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-def check_date_range_extracted(start_date: str, end_date: str, date_field: str = "created") -> bool:
-    """
-    Check if a specific date range has already been successfully extracted.
-
-    Parameters:
-    -----------
-    start_date : str
-        Start date in "YYYY-MM-DD" format
-    end_date : str
-        End date in "YYYY-MM-DD" format
-    date_field : str
-        The date field to check (default: "created")
-
-    Returns:
-    --------
-    bool: True if date range was already successfully extracted
-    """
-    if not os.path.exists(LOG_FILE_PATH):
-        return False
-
-    try:
-        with open(LOG_FILE_PATH, 'r', encoding='utf-8') as f:
-            log_data = json.load(f)
-
-        for entry in log_data:
-            params = entry.get('input_parameters', {})
-            output = entry.get('output', {})
-
-            if (params.get('start_date') == start_date and
-                    params.get('end_date') == end_date and
-                    params.get('date_field') == date_field and
-                    output.get('status') == 'success'):
-                return True
-
-        return False
-
-    except Exception:
-        return False
-
-
 if __name__ == "__main__":
-    # Default execution: Automatic date calculation
-    # End date: 3 days before today
-    # Start date: 1 day before end date
+    SLACK_TOKEN = os.getenv("SLACK_API_TOKEN", "")  # Get from environment variable
+    CHANNEL_ID = "C046JUQQGUC"
 
-    print("Jira Bug Extractor - Automatic Date Range")
+    if not SLACK_TOKEN:
+        print(" Error: SLACK_API_TOKEN environment variable not set")
+        print("Please set it using: export SLACK_API_TOKEN='your-token-here'")
+        exit(1)
+
+    print("Slack Thread Extractor")
     print("=" * 60)
     print(f"Today's date: {datetime.now().strftime('%Y-%m-%d')}")
 
-    # Run extraction with default dates
-    df, output_path = run_extraction()
+    # Run extraction with specific dates or use defaults
+    df, output_path = run_extraction(
+        token=SLACK_TOKEN,
+        channel_id=CHANNEL_ID,
+        start_date="2024-11-01",  # Optional: specify start date
+        end_date="2024-11-30",  # Optional: specify end date
+        max_threads=None,  # Optional: limit number of threads
+        skip_if_exists=False  # Optional: skip if file exists
+    )
 
     if output_path:
-        print(f"\n File ready for download: {output_path}")
+        print(f"\nFile ready: {output_path}")
 
-    # Display extraction history summary
     print("\n" + "=" * 60)
     print("Extraction History Summary")
     print("=" * 60)
     summary = get_extraction_summary()
     for key, value in summary.items():
         print(f"{key.replace('_', ' ').title()}: {value}")
+
+    # View recent extraction history
+    print("\n" + "=" * 60)
+    print("Recent Extraction Runs")
+    print("=" * 60)
+    history_df = view_extraction_history(last_n=5)
+    if not history_df.empty:
+        print(history_df.to_string(index=False))
