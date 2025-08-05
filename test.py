@@ -4,13 +4,17 @@ from datetime import datetime, timedelta
 from tqdm import tqdm
 import traceback
 
-import pandas as pd
 import requests
+import pandas as pd
 import json
 import time
 import re
 import os
 import random
+
+
+from common.prompts import sys_prompts_extraction
+from common.models.model import load_model
 
 # Constants
 MAX_RETRIES = 5
@@ -18,6 +22,7 @@ INITIAL_BACKOFF = 1
 RATE_LIMIT_STATUS = 429
 DEFAULT_LIMIT = 100
 MAX_MESSAGES_PER_THREAD = 1000
+MAX_CONVERSATION_LENGTH = 30000  # Character limit for LLM processing
 
 # Base directory for saving data
 BASE_OUTPUT_DIR = "./csv_data"
@@ -41,6 +46,11 @@ def clean_text(text: str | None) -> str:
     # Normalize whitespace
     text = ' '.join(text.split())
     return text.strip()
+
+
+def remove_hyperlink(text: str) -> str:
+    """Remove Slack hyperlinks from text."""
+    return re.sub("<https:.*?>", " ", text)
 
 
 def replace_name_tags(text: str) -> str:
@@ -72,9 +82,7 @@ def make_request_with_backoff(session: requests.Session,
                               params: Dict[str, Any],
                               max_retries: int = MAX_RETRIES,
                               initial_backoff: float = INITIAL_BACKOFF) -> Optional[Dict]:
-    """
-    Make HTTP request with exponential backoff for rate limiting.
-    """
+    """Make HTTP request with exponential backoff for rate limiting."""
     for attempt in range(max_retries):
         try:
             response = session.get(url, params=params)
@@ -87,26 +95,24 @@ def make_request_with_backoff(session: requests.Session,
                     print(f"Rate limited. Retrying in {backoff_time:.2f} seconds...")
                     time.sleep(backoff_time)
                 else:
-                    print(" Max retries reached. Skipping this request.")
+                    print("Max retries reached. Skipping this request.")
                     return None
             else:
-                print(f" HTTP error: {e}")
+                print(f"HTTP error: {e}")
                 return None
         except requests.RequestException as e:
-            print(f" Request Error: {e}")
+            print(f"Request Error: {e}")
             return None
 
 
 def fetch_workspace_data(session: requests.Session) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
-    """
-    Fetch all users, channels, and user groups in the workspace.
-    """
+    """Fetch all users, channels, and user groups in the workspace."""
     print("Fetching workspace data...")
 
     # Fetch users
     users = {}
     cursor = None
-    print("Fetching users...")
+    print("  Fetching users...")
 
     while True:
         params = {'limit': 200}
@@ -127,15 +133,15 @@ def fetch_workspace_data(session: requests.Session) -> Tuple[Dict[str, str], Dic
             else:
                 break
         else:
-            print("Error fetching users. Some user IDs may not be resolved.")
+            print("  Error fetching users. Some user IDs may not be resolved.")
             break
 
-    print(f"Found {len(users)} users")
+    print(f"  Found {len(users)} users")
 
     # Fetch channels
     channels = {}
     cursor = None
-    print("Fetching channels...")
+    print("  Fetching channels...")
 
     while True:
         params = {'limit': 200, 'types': 'public_channel,private_channel'}
@@ -153,22 +159,22 @@ def fetch_workspace_data(session: requests.Session) -> Tuple[Dict[str, str], Dic
             else:
                 break
         else:
-            print("Error fetching channels. Some channel IDs may not be resolved.")
+            print("  Error fetching channels. Some channel IDs may not be resolved.")
             break
 
-    print(f"Found {len(channels)} channels")
+    print(f"  Found {len(channels)} channels")
 
     # Fetch user groups
     usergroups = {}
-    print("Fetching user groups...")
+    print("  Fetching user groups...")
 
     data = make_request_with_backoff(session, USERGROUPS_LIST_URL, {})
     if data and data['ok']:
         for group in data['usergroups']:
             usergroups[group['id']] = group['handle']
-        print(f"Found {len(usergroups)} user groups")
+        print(f"  Found {len(usergroups)} user groups")
     else:
-        print("Error fetching user groups. Some user group IDs may not be resolved.")
+        print("  Error fetching user groups. Some user group IDs may not be resolved.")
 
     return users, channels, usergroups
 
@@ -199,9 +205,7 @@ def resolve_names(text: str, users: Dict[str, str], channels: Dict[str, str], us
 
 
 def fetch_thread_replies(session: requests.Session, channel_id: str, thread_ts: str) -> List[Dict]:
-    """
-    Fetch all replies in a thread.
-    """
+    """Fetch all replies in a thread."""
     replies_params = {
         "channel": channel_id,
         "ts": thread_ts,
@@ -235,9 +239,7 @@ def format_thread_data(thread: List[Dict],
                        users: Dict[str, str],
                        channels: Dict[str, str],
                        usergroups: Dict[str, str]) -> Dict[str, Any]:
-    """
-    Format a thread into a structured dictionary.
-    """
+    """Format a thread into a structured dictionary."""
     parent = thread[0]
 
     # Get user info
@@ -290,9 +292,7 @@ def extract_slack_threads(token: str,
                           start_date: Optional[str] = None,
                           end_date: Optional[str] = None,
                           max_threads: Optional[int] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Extract Slack threads from a channel within a date range.
-    """
+    """Extract Slack threads from a channel within a date range."""
     # Initialize session
     headers = {
         "Authorization": f"Bearer {token}",
@@ -364,7 +364,7 @@ def extract_slack_threads(token: str,
             else:
                 break
         else:
-            print(" Error fetching messages. Exiting.")
+            print("Error fetching messages. Exiting.")
             break
 
     pbar.close()
@@ -390,12 +390,131 @@ def extract_slack_threads(token: str,
     return df, stats
 
 
-def generate_filename(start_date: str, end_date: str, channel_id: str, prefix: str = "slack_threads") -> str:
+def process_with_llm(raw_file_path: str,
+                     summary_file_path: str,
+                     llm_model: str = "SelfHealing-gpt-40",
+                     api_version: str = "2024-02-01") -> Dict[str, Any]:
+    """Process extracted Slack conversations with LLM to extract issues and metadata."""
+    print(f"\nProcessing conversations with LLM...")
+    print(f"  Input: {raw_file_path}")
+    print(f"  Output: {summary_file_path}")
+
+    llm = load_model('openaichat')
+
+    processed_count = 0
+    skipped_count = 0
+    error_count = 0
+
+    try:
+        # Read the raw CSV file
+        df = pd.read_csv(raw_file_path, encoding='utf-8-sig')
+        total_rows = len(df)
+
+        # Prepare summary data
+        summary_data = []
+
+        # Process each conversation
+        for idx, row in tqdm(df.iterrows(), total=total_rows, desc="Processing with LLM"):
+            try:
+                conv = remove_hyperlink(row['conversation'])
+
+                if len(conv) > MAX_CONVERSATION_LENGTH:
+                    skipped_count += 1
+                    continue
+
+                # Extract issues using LLM
+                llm.SYS_PROMPT = sys_prompts_extraction.slack_oai_issue_extract
+                issue_extraction = llm.generate_response(
+                    input_data=conv,
+                    model=llm_model,
+                    api_version=api_version,
+                    max_tokens=10000
+                )
+
+                if "NA" in issue_extraction:
+                    skipped_count += 1
+                    continue
+
+                # Extract metadata using LLM
+                llm.SYS_PROMPT = sys_prompts_extraction.slack_oai_metadata_extraction
+                metadata = llm.generate_response(
+                    input_data=conv,
+                    model=llm_model,
+                    api_version=api_version,
+                    max_tokens=10000
+                )
+
+                category, context, groupID, tag = [
+                    text for text in metadata.split("\n") if text.strip()
+                ]
+                issue, resolution = issue_extraction.split("==========================")
+                issue, resolution = issue.strip(), resolution.strip()
+                resolution_summary = f"{category}\n{issue}\n{resolution}\n{context}\n{groupID}\n{tag}"
+
+                summary_data.append({
+                    'Conversation': conv,
+                    'Summary': resolution_summary,
+                    'High Level Cause': category,
+                    'Short Description': f"{issue}\n{context}",
+                    'Resolution Type': resolution,
+                    'Assignment Group': groupID,
+                    'Tag': tag,
+                    'Resolved': 'yes',
+                    'Date': row['date'],
+                    'Ts': row['timestamp']
+                })
+
+                processed_count += 1
+                print(resolution_summary)
+                print("\n")
+
+            except Exception as e:
+                error_count += 1
+                if idx < 5:  # Only print first few errors
+                    print(f"  Error processing row {idx}: {str(e)}")
+
+        # Save summary data
+        if summary_data:
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_csv(summary_file_path, index=False, encoding='utf-8-sig')
+            print(f"\nSaved {len(summary_data)} processed conversations to summary file")
+        else:
+            print("\nNo conversations were successfully processed")
+
+        # Return statistics
+        return {
+            'total_conversations': total_rows,
+            'processed': processed_count,
+            'skipped': skipped_count,
+            'errors': error_count,
+            'success_rate': f"{(processed_count / total_rows) * 100:.1f}%" if total_rows > 0 else "0%"
+        }
+
+    except Exception as e:
+        print(f"\nError during LLM processing: {str(e)}")
+        return {
+            'total_conversations': 0,
+            'processed': 0,
+            'skipped': 0,
+            'errors': 1,
+            'error_message': str(e)
+        }
+
+
+def generate_filename(start_date: str, end_date: str, channel_id: str, file_type: str = "raw") -> str:
     """Generate filename with date and channel convention."""
     start_str = format_date_for_filename(start_date)
     end_str = format_date_for_filename(end_date)
+
+    # Sanitize channel ID for filename
     safe_channel = re.sub(r'[^\w\-]', '_', channel_id)
-    return f"{prefix}_{safe_channel}_{start_str}_to_{end_str}.csv"
+
+    if file_type == "raw":
+        return f"slack_threads_raw_{safe_channel}_{start_str}_to_{end_str}.csv"
+    elif file_type == "summary":
+        return f"slack_threads_summary_{safe_channel}_{start_str}_to_{end_str}.csv"
+    else:
+        return f"slack_threads_{file_type}_{safe_channel}_{start_str}_to_{end_str}.csv"
 
 
 def log_extraction_run(log_entry: Dict[str, Any], max_log_entries: int = 1000):
@@ -429,17 +548,19 @@ def create_log_entry(token_id: str,
                      end_date: str,
                      status: str,
                      threads_count: int = 0,
-                     output_file: str = "",
+                     raw_output_file: str = "",
+                     summary_output_file: str = "",
                      error_message: str = "",
                      execution_time_seconds: float = 0,
-                     stats: Optional[Dict] = None) -> Dict[str, Any]:
+                     extraction_stats: Optional[Dict] = None,
+                     processing_stats: Optional[Dict] = None) -> Dict[str, Any]:
     """Create a standardized log entry for the extraction run."""
     return {
         "run_timestamp": datetime.now().isoformat(),
         "run_date": datetime.now().strftime("%Y-%m-%d"),
         "run_time": datetime.now().strftime("%H:%M:%S"),
         "input_parameters": {
-            "token_id": token_id,  # Store only identifier, not actual token
+            "token_id": token_id,
             "channel_id": channel_id,
             "start_date": start_date,
             "end_date": end_date
@@ -447,70 +568,79 @@ def create_log_entry(token_id: str,
         "output": {
             "status": status,
             "threads_count": threads_count,
-            "output_file": output_file,
+            "raw_output_file": raw_output_file,
+            "summary_output_file": summary_output_file,
             "execution_time_seconds": round(execution_time_seconds, 2),
-            "stats": stats or {}
+            "extraction_stats": extraction_stats or {},
+            "processing_stats": processing_stats or {}
         },
         "error": error_message if error_message else None
     }
 
 
 def get_default_date_range(days_back: int = 7) -> Tuple[str, str]:
-    """
-    Get default date range.
-    """
+    """Get default date range."""
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days_back)
 
     return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
 
 
-def run_extraction(token: str,
-                   channel_id: str,
-                   start_date: Optional[str] = None,
-                   end_date: Optional[str] = None,
-                   max_threads: Optional[int] = None,
-                   skip_if_exists: bool = False) -> Tuple[pd.DataFrame, str]:
-    """
-    Run the Slack thread extraction with specified parameters.
-    """
+def run_extraction_pipeline(token: str,
+                            channel_id: str,
+                            start_date: Optional[str] = None,
+                            end_date: Optional[str] = None,
+                            max_threads: Optional[int] = None,
+                            skip_if_exists: bool = False,
+                            process_with_llm_flag: bool = True) -> Tuple[pd.DataFrame, str, str]:
+    """Run the complete Slack extraction and processing pipeline."""
     start_time = datetime.now()
 
     # Use default dates if not provided
     if start_date is None or end_date is None:
         start_date, end_date = get_default_date_range()
 
-    # Generate filename
-    filename = generate_filename(start_date, end_date, channel_id)
-    output_path = os.path.join(BASE_OUTPUT_DIR, filename)
+    # Generate filenames
+    raw_filename = generate_filename(start_date, end_date, channel_id, file_type="raw")
+    summary_filename = generate_filename(start_date, end_date, channel_id, file_type="summary")
+
+    raw_output_path = os.path.join(BASE_OUTPUT_DIR, raw_filename)
+    summary_output_path = os.path.join(BASE_OUTPUT_DIR, summary_filename)
 
     # Check if already exists
-    if skip_if_exists and os.path.exists(output_path):
-        print(f"Skipping extraction: File already exists at {output_path}")
-        return pd.DataFrame(), output_path
+    if skip_if_exists and os.path.exists(raw_output_path):
+        print(f"Skipping extraction: File already exists at {raw_output_path}")
+        return pd.DataFrame(), raw_output_path, summary_output_path
 
     # Ensure output directory exists
     os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
 
     print(f"\n{'=' * 60}")
-    print(f"Slack Thread Extractor")
+    print(f"Slack Thread Extraction & Processing Pipeline")
     print(f"{'=' * 60}")
-    print(f"Extracting threads from {start_date} to {end_date}")
-    print(f"Output file: {output_path}")
+    print(f"Date range: {start_date} to {end_date}")
+    print(f"Raw output: {raw_output_path}")
+    if process_with_llm_flag:
+        print(f"Summary output: {summary_output_path}")
 
     # Initialize variables for logging
     df = pd.DataFrame()
     status = "failed"
     error_message = ""
     threads_count = 0
-    stats = {}
+    extraction_stats = {}
+    processing_stats = {}
 
     # Mask token for logging
     token_id = f"{token[:10]}...{token[-4:]}" if len(token) > 14 else "hidden"
 
     try:
-        # Extract threads
-        df, stats = extract_slack_threads(
+        # Step 1: Extract threads
+        print(f"\n{'=' * 40}")
+        print("Step 1: Extracting Slack threads")
+        print(f"{'=' * 40}")
+
+        df, extraction_stats = extract_slack_threads(
             token=token,
             channel_id=channel_id,
             start_date=start_date,
@@ -521,22 +651,45 @@ def run_extraction(token: str,
         threads_count = len(df)
 
         if threads_count > 0:
-            # Save to CSV
-            df.to_csv(output_path, index=False, encoding='utf-8-sig')
+            # Save raw data
+            df.to_csv(raw_output_path, index=False, encoding='utf-8-sig')
             print(f"\nSuccessfully extracted {threads_count} threads")
-            print(f"Saved to: {output_path}")
-            status = "success"
+            print(f"Saved raw data to: {raw_output_path}")
+
+            # Step 2: Process with LLM if requested
+            if process_with_llm_flag:
+                print(f"\n{'=' * 40}")
+                print("Step 2: Processing with LLM")
+                print(f"{'=' * 40}")
+
+                processing_stats = process_with_llm(
+                    raw_file_path=raw_output_path,
+                    summary_file_path=summary_output_path
+                )
+
+                if processing_stats.get('processed', 0) > 0:
+                    print(f"Saved summary to: {summary_output_path}")
+                    status = "success"
+                else:
+                    print("No conversations were processed by LLM")
+                    status = "partial_success"
+                    summary_output_path = ""
+            else:
+                status = "success"
+                summary_output_path = ""
         else:
             print(f"\nNo threads found for the specified criteria")
             status = "no_data"
-            output_path = ""
+            raw_output_path = ""
+            summary_output_path = ""
 
     except Exception as e:
         error_message = str(e)
-        print(f"\n Error during extraction: {error_message}")
+        print(f"\nError during pipeline execution: {error_message}")
         print(traceback.format_exc())
         status = "failed"
-        output_path = ""
+        raw_output_path = ""
+        summary_output_path = ""
 
     # Calculate execution time
     execution_time = (datetime.now() - start_time).total_seconds()
@@ -549,25 +702,41 @@ def run_extraction(token: str,
         end_date=end_date,
         status=status,
         threads_count=threads_count,
-        output_file=output_path,
+        raw_output_file=raw_output_path,
+        summary_output_file=summary_output_path,
         error_message=error_message,
         execution_time_seconds=execution_time,
-        stats=stats
+        extraction_stats=extraction_stats,
+        processing_stats=processing_stats
     )
 
     log_extraction_run(log_entry)
 
-    # Print summary
-    if stats:
-        print(f"\nExtraction Summary:")
-        print(f"  - Total threads: {stats['total_threads']}")
-        print(f"  - Total messages: {stats['total_messages']}")
-        print(f"  - Total replies: {stats['total_replies']}")
-        print(f"  - Unique participants: {stats['unique_participants']}")
-        print(f"  - Channel: {stats['channel_name']}")
-        print(f"  - Execution time: {execution_time:.2f} seconds")
+    # Print final summary
+    print(f"\n{'=' * 60}")
+    print("Pipeline Summary")
+    print(f"{'=' * 60}")
 
-    return df, output_path
+    if extraction_stats:
+        print("\nExtraction Statistics:")
+        print(f"  - Total threads: {extraction_stats['total_threads']}")
+        print(f"  - Total messages: {extraction_stats['total_messages']}")
+        print(f"  - Total replies: {extraction_stats['total_replies']}")
+        print(f"  - Unique participants: {extraction_stats['unique_participants']}")
+        print(f"  - Channel: {extraction_stats['channel_name']}")
+
+    if processing_stats and process_with_llm_flag:
+        print("\nProcessing Statistics:")
+        print(f"  - Total conversations: {processing_stats.get('total_conversations', 0)}")
+        print(f"  - Processed: {processing_stats.get('processed', 0)}")
+        print(f"  - Skipped: {processing_stats.get('skipped', 0)}")
+        print(f"  - Errors: {processing_stats.get('errors', 0)}")
+        print(f"  - Success rate: {processing_stats.get('success_rate', 'N/A')}")
+
+    print(f"\nTotal execution time: {execution_time:.2f} seconds")
+    print(f"{'=' * 60}")
+
+    return df, raw_output_path, summary_output_path
 
 
 def view_extraction_history(last_n: int = 10) -> pd.DataFrame:
@@ -594,6 +763,7 @@ def view_extraction_history(last_n: int = 10) -> pd.DataFrame:
             'input_parameters.end_date',
             'output.status',
             'output.threads_count',
+            'output.processing_stats.processed',
             'output.execution_time_seconds'
         ]
 
@@ -606,6 +776,7 @@ def view_extraction_history(last_n: int = 10) -> pd.DataFrame:
             'input_parameters.end_date': 'end_date',
             'output.status': 'status',
             'output.threads_count': 'threads',
+            'output.processing_stats.processed': 'processed',
             'output.execution_time_seconds': 'exec_time'
         }
         df_log = df_log.rename(columns=rename_dict)
@@ -619,7 +790,7 @@ def view_extraction_history(last_n: int = 10) -> pd.DataFrame:
         return df_log
 
     except Exception as e:
-        print(f" Error reading log file: {e}")
+        print(f"Error reading log file: {e}")
         return pd.DataFrame()
 
 
@@ -637,9 +808,16 @@ def get_extraction_summary() -> Dict[str, Any]:
 
         total_runs = len(log_data)
         successful_runs = sum(1 for entry in log_data if entry.get('output', {}).get('status') == 'success')
+        partial_success_runs = sum(
+            1 for entry in log_data if entry.get('output', {}).get('status') == 'partial_success')
         failed_runs = sum(1 for entry in log_data if entry.get('output', {}).get('status') == 'failed')
         no_data_runs = sum(1 for entry in log_data if entry.get('output', {}).get('status') == 'no_data')
+
         total_threads = sum(entry.get('output', {}).get('threads_count', 0) for entry in log_data)
+        total_processed = sum(
+            entry.get('output', {}).get('processing_stats', {}).get('processed', 0)
+            for entry in log_data
+        )
 
         run_dates = [entry.get('run_date') for entry in log_data if entry.get('run_date')]
         first_run = min(run_dates) if run_dates else "N/A"
@@ -655,13 +833,15 @@ def get_extraction_summary() -> Dict[str, Any]:
         return {
             "total_runs": total_runs,
             "successful_runs": successful_runs,
+            "partial_success_runs": partial_success_runs,
             "failed_runs": failed_runs,
             "no_data_runs": no_data_runs,
             "total_threads_extracted": total_threads,
+            "total_conversations_processed": total_processed,
             "unique_channels": len(channels),
             "first_run_date": first_run,
             "last_run_date": last_run,
-            "success_rate": f"{(successful_runs / total_runs) * 100:.1f}%" if total_runs > 0 else "N/A"
+            "success_rate": f"{((successful_runs + partial_success_runs) / total_runs) * 100:.1f}%" if total_runs > 0 else "N/A"
         }
 
     except Exception as e:
@@ -669,33 +849,36 @@ def get_extraction_summary() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    SLACK_TOKEN = os.getenv("SLACK_API_TOKEN", "")  # Get from environment variable
+    SLACK_TOKEN = os.getenv("SLACK_API_TOKEN", "") 
     CHANNEL_ID = "C046JUQQGUC"
 
     if not SLACK_TOKEN:
-        print(" Error: SLACK_API_TOKEN environment variable not set")
+        print("Error: SLACK_API_TOKEN environment variable not set")
         print("Please set it using: export SLACK_API_TOKEN='your-token-here'")
         exit(1)
 
-    print("Slack Thread Extractor")
+    print("Slack Thread Extraction & Processing Pipeline")
     print("=" * 60)
     print(f"Today's date: {datetime.now().strftime('%Y-%m-%d')}")
 
-    # Run extraction with specific dates or use defaults
-    df, output_path = run_extraction(
+    # Run the complete pipeline
+    df, raw_path, summary_path = run_extraction_pipeline(
         token=SLACK_TOKEN,
         channel_id=CHANNEL_ID,
         start_date="2024-11-01",  # Optional: specify start date
         end_date="2024-11-30",  # Optional: specify end date
         max_threads=None,  # Optional: limit number of threads
-        skip_if_exists=False  # Optional: skip if file exists
+        skip_if_exists=False,  # Optional: skip if file exists
+        process_with_llm_flag=True  # Set to False to skip LLM processing
     )
 
-    if output_path:
-        print(f"\nFile ready: {output_path}")
+    if raw_path:
+        print(f"\nRaw file: {raw_path}")
+    if summary_path:
+        print(f"Summary file: {summary_path}")
 
     print("\n" + "=" * 60)
-    print("Extraction History Summary")
+    print("Pipeline History Summary")
     print("=" * 60)
     summary = get_extraction_summary()
     for key, value in summary.items():
@@ -703,7 +886,7 @@ if __name__ == "__main__":
 
     # View recent extraction history
     print("\n" + "=" * 60)
-    print("Recent Extraction Runs")
+    print("Recent Pipeline Runs")
     print("=" * 60)
     history_df = view_extraction_history(last_n=5)
     if not history_df.empty:
