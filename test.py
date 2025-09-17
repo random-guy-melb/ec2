@@ -1,5 +1,4 @@
 layout = """
-layout = """
 [data-testid="stAppViewContainer"] {
     background: linear-gradient(135deg, #f0f0f0 0%, #f2f2f2 10%, #f5f5f5 20%, #f8f8f8 40%, #fff8f2 60%, #fff0eb 80%, #ffe8e0 100%);
 }
@@ -37,7 +36,7 @@ header[data-testid="stHeader"],
     padding: 10px;
 }
 
-/* Chat input specific styling - UPDATED */
+/* Chat input specific styling */
 .stChatInput {
     position: relative !important;
     bottom: auto !important;
@@ -91,15 +90,6 @@ header[data-testid="stHeader"],
     display: flex;
     align-items: center;
     height: 100%;
-}
-
-/* Override the default chat input styling */
-div[data-testid="stChatInput"] {
-    position: relative !important;
-    width: 100% !important;
-    border: none !important;
-    outline: none !important;
-    box-shadow: none !important;
 }
 
 /* General input styling */
@@ -175,18 +165,22 @@ button[data-testid="stBaseButton-primary"]:hover {
 
 /* ========== FIXED USER MESSAGE STYLING ========== */
 
-/* Container for user messages - right aligned */
-.stChatMessage:has([data-testid="stChatMessageAvatarUser"]) {
+/* Reset default chat message styling first */
+.stChatMessage {
+    background: transparent !important;
+    padding: 0 !important;
+}
+
+/* User message - main container */
+.stChatMessage[data-testid="stChatMessageContainer-user"] {
     display: flex !important;
     justify-content: flex-end !important;
     width: 100% !important;
     margin: 8px 0 !important;
-    padding: 0 !important;
-    background: transparent !important;
 }
 
-/* User message bubble - fits content */
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+/* User message bubble - content wrapper */
+.stChatMessage[data-testid="stChatMessageContainer-user"] > div:first-child {
     background: linear-gradient(135deg, #E8605C 0%, #F9B3A4 100%) !important;
     color: black !important;
     border-radius: 18px !important;
@@ -196,42 +190,53 @@ button[data-testid="stBaseButton-primary"]:hover {
     display: inline-block !important;
     max-width: 70% !important;
     width: auto !important;
+    margin-left: auto !important;
     word-wrap: break-word !important;
     white-space: pre-wrap !important;
 }
 
-/* User message content wrapper */
-[data-testid="stChatMessageContent"]:has(+ [data-testid="stChatMessageAvatarUser"]),
-[data-testid="stChatMessageAvatarUser"] + [data-testid="stChatMessageContent"] {
-    display: inline-block !important;
-    width: auto !important;
-    max-width: 100% !important;
+/* Alternative selectors for user messages in case structure varies */
+[data-testid="stChatMessage"]:has(.stChatMessageContent[data-testid*="user"]),
+[data-testid="stChatMessage"]:has([aria-label*="user" i]) {
+    display: flex !important;
+    justify-content: flex-end !important;
+    width: 100% !important;
     background: transparent !important;
 }
 
+[data-testid="stChatMessage"]:has(.stChatMessageContent[data-testid*="user"]) > div,
+[data-testid="stChatMessage"]:has([aria-label*="user" i]) > div {
+    background: linear-gradient(135deg, #E8605C 0%, #F9B3A4 100%) !important;
+    color: black !important;
+    border-radius: 18px !important;
+    padding: 10px 16px !important;
+    display: inline-block !important;
+    max-width: 70% !important;
+    width: auto !important;
+    margin-left: auto !important;
+}
+
 /* User message text content */
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) p,
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) div[data-testid="stMarkdownContainer"] {
+.stChatMessage[data-testid="stChatMessageContainer-user"] p,
+.stChatMessage[data-testid="stChatMessageContainer-user"] div[data-testid="stMarkdownContainer"] {
     margin: 0 !important;
     padding: 0 !important;
     background: transparent !important;
-    display: inline !important;
+    color: black !important;
 }
 
 /* ========== ASSISTANT MESSAGE STYLING ========== */
 
-/* Assistant message container */
-.stChatMessage:has([data-testid="stChatMessageAvatarAssistant"]) {
+/* Assistant message - main container */
+.stChatMessage[data-testid="stChatMessageContainer-assistant"] {
     display: flex !important;
     justify-content: flex-start !important;
     width: 100% !important;
     margin: 8px 0 !important;
-    padding: 0 !important;
-    background: transparent !important;
 }
 
 /* Assistant message bubble */
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
+.stChatMessage[data-testid="stChatMessageContainer-assistant"] > div:first-child {
     background: white !important;
     border-radius: 18px !important;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1) !important;
@@ -239,6 +244,7 @@ button[data-testid="stBaseButton-primary"]:hover {
     display: inline-block !important;
     max-width: 70% !important;
     width: auto !important;
+    margin-right: auto !important;
     min-height: 40px !important;
     color: rgb(45, 55, 72) !important;
     font-weight: 500 !important;
@@ -246,29 +252,56 @@ button[data-testid="stBaseButton-primary"]:hover {
     -webkit-font-smoothing: antialiased !important;
 }
 
-/* Assistant message content */
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) p,
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) div[data-testid="stMarkdownContainer"] {
+/* Alternative selectors for assistant messages */
+[data-testid="stChatMessage"]:has(.stChatMessageContent[data-testid*="assistant"]),
+[data-testid="stChatMessage"]:has([aria-label*="assistant" i]) {
+    display: flex !important;
+    justify-content: flex-start !important;
+    width: 100% !important;
+    background: transparent !important;
+}
+
+[data-testid="stChatMessage"]:has(.stChatMessageContent[data-testid*="assistant"]) > div,
+[data-testid="stChatMessage"]:has([aria-label*="assistant" i]) > div {
+    background: white !important;
+    border-radius: 18px !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1) !important;
+    padding: 12px 16px !important;
+    display: inline-block !important;
+    max-width: 70% !important;
+    width: auto !important;
+    margin-right: auto !important;
+}
+
+/* Assistant message text content */
+.stChatMessage[data-testid="stChatMessageContainer-assistant"] p,
+.stChatMessage[data-testid="stChatMessageContainer-assistant"] div[data-testid="stMarkdownContainer"] {
     margin: 0 !important;
     padding: 0 !important;
     background: transparent !important;
 }
 
-/* Ensure all message children have transparent backgrounds */
-[data-testid="stChatMessage"] > * {
+/* Remove any default padding/margins that might interfere */
+[data-testid="stChatMessageContent"] {
+    padding: 0 !important;
+    margin: 0 !important;
     background: transparent !important;
 }
 
-/* Remove any default Streamlit message styling that might interfere */
-.stChatMessage {
-    flex-direction: row !important;
+/* Ensure proper text wrapping in all messages */
+.stChatMessage p {
+    word-wrap: break-word !important;
+    white-space: pre-wrap !important;
+    overflow-wrap: break-word !important;
 }
 
-/* Fix for message content container */
-[data-testid="stChatMessageContent"] {
-    width: auto !important;
-    flex-grow: 0 !important;
-    display: inline-block !important;
+/* Fix for any potential flexbox issues */
+.stChatMessage > div {
+    flex-shrink: 0 !important;
 }
-"""
+
+/* Override any default Streamlit chat message backgrounds */
+div[class*="ChatMessage"] {
+    background: transparent !important;
+}
 """
