@@ -63,6 +63,28 @@ SUGGESTIONS = [
 col1, col2 = st.columns([1, 3], gap="large")
 
 with col1:
+    # Elegant welcome tile
+    st.markdown("""
+            <div style="
+                background: linear-gradient(135deg, #F3E8FF 0%, #FAF5FF 100%);
+                padding: 25px 30px;
+                border-radius: 20px;
+                border: 1px solid #E9D5FF;
+                margin-bottom: 25px;
+                box-shadow: 0 4px 12px rgba(167, 139, 250, 0.15);
+            ">
+                <p style="
+                    color: #7C3AED;
+                    margin: 0;
+                    font-size: 24px;
+                    font-weight: 300;
+                    letter-spacing: 1px;
+                    font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+                ">
+                    Welcome, <span style="font-weight: 500; color: #6B21A8;">UserName</span>
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
     with st.container(border=True):
         st.subheader("⚡ Quick Suggestions")
         for idx, text in enumerate(SUGGESTIONS):
